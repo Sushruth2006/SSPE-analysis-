@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.venv/
+env/
+venv/
+ENV/
+
+# Data
+data/train/*
+data/test/*
+!data/README.md
+
+# Models/Weights
+*.pth
+*.pt
+
+# System/IDE
+.DS_Store
+.vscode/
+.idea/
