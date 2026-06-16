@@ -76,11 +76,12 @@ class FiLMLayer(nn.Module):
         self.gamma = nn.Linear(cond_dim, feature_dim)
         self.beta = nn.Linear(cond_dim, feature_dim)
         
-        # Initialize weights to zero so that at the very start of training, 
-        # the network acts as a standard Transformer before learning to modulate.
-        nn.init.zeros_(self.gamma.weight)
+        # -> FIX: Initialize weights close to zero with a tiny variance. 
+        # If initialized completely at 0, the gradients will be perfectly symmetrical
+        # across all neurons, destroying the layer's ability to learn complex modulation.
+        nn.init.normal_(self.gamma.weight, std=0.01)
         nn.init.zeros_(self.gamma.bias)
-        nn.init.zeros_(self.beta.weight)
+        nn.init.normal_(self.beta.weight, std=0.01)
         nn.init.zeros_(self.beta.bias)
 
     def forward(self, x, condition):
@@ -118,8 +119,8 @@ class RadermeckerTransformer(nn.Module):
         self.multiscale_cnn = MultiscaleCNNBlock(num_channels, d_model)
         self.pos_encoder = PositionalEncoding(d_model)
         
-        # -> UPGRADE: Replace the simple physics embedder with the FiLM conditioning block
-        self.film_gating = FiLMLayer(cond_dim=4, feature_dim=d_model)
+        # FiLM Conditioning Block replaces standard embedding concat
+        self.film_gating = FiLMLayer(cond_dim=6, feature_dim=d_model)
         
         encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=d_model*4, dropout=0.2, batch_first=True)
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)

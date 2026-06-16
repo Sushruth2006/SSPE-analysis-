@@ -39,6 +39,9 @@ EPOCHS = 50
 BATCH_SIZE = 32 
 LEARNING_RATE = 1e-4
 
+# Aggressive punishment multiplier for patient memorization
+MAX_GRL_ALPHA = 2.5 
+
 device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
 print(f"Training on device: {device}")
 
@@ -56,6 +59,7 @@ if len(train_files) == 0:
 patient_ids = list(range(len(train_files)))
 print(f"-> Found {len(train_files)} patient file(s): {train_files}")
 
+# Note: Your dataset.py MUST be updated to return the 6 physical features!
 dataset = RadermeckerDataset(
     edf_files=train_files, 
     event_dict={
@@ -115,7 +119,9 @@ for epoch in range(EPOCHS):
     model.train()
     
     p = float(epoch) / EPOCHS
-    alpha = 2. / (1. + np.exp(-10 * p)) - 1
+    
+    # Overdrive the Alpha schedule to hit MAX_GRL_ALPHA
+    alpha = MAX_GRL_ALPHA * (2. / (1. + np.exp(-10 * p)) - 1)
     
     running_clinical_loss = 0.0
     running_patient_loss = 0.0
@@ -126,17 +132,24 @@ for epoch in range(EPOCHS):
          print("Warning: Train loader is empty!")
          break
 
-    # -> EARLY FUSION UPDATE: The loader now yields 4 items, including the physics_tensor
     for batch_idx, (x, physics_tensor, y_clinical, y_patient) in enumerate(train_loader):
         
         x = x.to(device)
-        physics_tensor = physics_tensor.to(device) # <--- Send to GPU
+        
+        # -> THE FIX: We now expect and pass ALL 6 features to the FiLM layer
+        # Ensure your model.py FiLMLayer is initialized with cond_dim=6
+        physics_tensor = physics_tensor[:, :6].to(device) 
+        
         y_clinical = y_clinical.to(device)
         y_patient = y_patient.to(device)
         
+        # Biological Noise Injection (50% chance per batch)
+        if torch.rand(1).item() < 0.5:
+            jitter = torch.randn_like(x) * 0.05
+            x = x + jitter
+        
         optimizer.zero_grad()
         
-        # -> EARLY FUSION UPDATE: Pass the physics tensor into the model
         clinical_preds, patient_preds, latent_features, _ = model(x, physics_tensor, alpha=alpha)
         
         loss_clinical = criterion_clinical(clinical_preds, y_clinical)

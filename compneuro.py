@@ -12,14 +12,15 @@ from matplotlib.widgets import Button
 from scipy.signal import welch
 from scipy.stats import entropy
 from sklearn.manifold import TSNE
-from sklearn.cluster import KMeans
+from sklearn.mixture import GaussianMixture
+from numpy.lib.stride_tricks import sliding_window_view
 from model import RadermeckerTransformer
 
 # ==========================================
 # 0. Master Configuration 
 # ==========================================
 ENABLE_INTEL_NPU = False 
-BATCH_SIZE = 64 # Determines how many windows the AI processes simultaneously
+BATCH_SIZE = 64 
 
 # ==========================================
 # 1. The Human-In-The-Loop GUI Class
@@ -128,19 +129,19 @@ if ENABLE_INTEL_NPU:
 # ==========================================
 # 3. Advanced DSP Feature Extractors
 # ==========================================
-def calculate_relative_delta(raw_window, fs=256):
-    freqs, psd = welch(raw_window[9], fs=fs, nperseg=fs)
+def extract_frequency_features(raw_window, fs=256):
+    freqs, psd = welch(raw_window[9], fs=fs, nperseg=fs) 
+    
     delta_mask = (freqs >= 1.0) & (freqs <= 4.0)
     alpha_mask = (freqs >= 8.0) & (freqs <= 12.0)
-    
     delta_power = np.trapezoid(psd[delta_mask], freqs[delta_mask])
     alpha_power = np.trapezoid(psd[alpha_mask], freqs[alpha_mask])
-    return delta_power / (alpha_power + 1e-6)
-
-def calculate_spectral_entropy(raw_window, fs=256):
-    freqs, psd = welch(raw_window[9], fs=fs, nperseg=fs)
+    delta_ratio = delta_power / (alpha_power + 1e-6)
+    
     psd_norm = psd / np.sum(psd)
-    return entropy(psd_norm)
+    spec_entropy = entropy(psd_norm)
+    
+    return delta_ratio, spec_entropy
 
 # ==========================================
 # 4. The Auto-Extraction Pipeline
@@ -192,15 +193,12 @@ def analyze_cohort(test_folder_path, confidence_threshold=0.50):
         window_samples = int(8 * fs)    
         step_samples = int(0.25 * fs)   
         
-        # --- EARLY FUSION: GLOBAL BACKGROUND BASELINE ---
         global_background_baseline = np.percentile(np.abs(data), 25)
         global_background_baseline = np.maximum(global_background_baseline, 1.0)
-        # ------------------------------------------------
         
         candidates = []
         tensor_queue = queue.Queue(maxsize=100) 
         
-        # --- SPEED UPGRADE 1: EARLY FUSION WORKER ---
         def npu_inference_worker():
             with torch.inference_mode(): 
                 while True:
@@ -215,12 +213,12 @@ def analyze_cohort(test_folder_path, confidence_threshold=0.50):
                     x_tensor_normal = torch.tensor(norm_windows, dtype=torch.float32).to(device)
                     physics_tensor = torch.tensor(physics_features, dtype=torch.float32).to(device)
                     
-                    # -> EARLY FUSION FORWARD PASS
-                    preds_normal, _, latent_normal, _ = model(x_tensor_normal, physics_tensor, alpha=0.0)
+                    # 4 Features fed to FiLM: Voltage, SNR, Delta, Entropy
+                    preds_normal, _, latent_normal, _ = model(x_tensor_normal, physics_tensor[:, :4], alpha=0.0)
                     confs_normal = torch.softmax(preds_normal, dim=1)[:, 0].cpu().numpy()
                     
                     x_tensor_inv = torch.tensor(norm_windows * -1.0, dtype=torch.float32).to(device)
-                    preds_inv, _, latent_inv, _ = model(x_tensor_inv, physics_tensor, alpha=0.0)
+                    preds_inv, _, latent_inv, _ = model(x_tensor_inv, physics_tensor[:, :4], alpha=0.0)
                     confs_inv = torch.softmax(preds_inv, dim=1)[:, 0].cpu().numpy()
                     
                     latent_normal_np = latent_normal.cpu().numpy()
@@ -245,7 +243,7 @@ def analyze_cohort(test_folder_path, confidence_threshold=0.50):
                                 "conf": final_conf,
                                 "latent": chosen_latent,
                                 "raw_window": raw_window.copy(),
-                                "physics": phys_arr # Recovered for CSV
+                                "physics": phys_arr 
                             })
                     
                     tensor_queue.task_done()
@@ -254,56 +252,95 @@ def analyze_cohort(test_folder_path, confidence_threshold=0.50):
         npu_thread.daemon = True 
         npu_thread.start()
         
-        current_batch = []
-        for start_idx in range(0, data.shape[1] - window_samples, step_samples):
-            raw_window = data[:, start_idx : start_idx + window_samples]
-            timestamp_start = start_idx / fs
+        num_windows = (data.shape[1] - window_samples) // step_samples + 1
+        if num_windows > 0:
+            strided_data = sliding_window_view(data, window_shape=window_samples, axis=1)
+            strided_data = strided_data[:, ::step_samples, :]
+            strided_data = np.swapaxes(strided_data, 0, 1) 
             
-            voltage_envelope = np.mean(np.abs(raw_window), axis=0)
-            peak_sample_idx = np.argmax(voltage_envelope)
-            peak_time_in_window = peak_sample_idx / fs
-            true_burst_time = timestamp_start + peak_time_in_window
+            print(f"   -> Scanning {strided_data.shape[0]} frames...")
+            abs_strided = np.abs(strided_data)
+            max_per_channel_all = np.max(abs_strided, axis=2) 
             
-            max_per_channel = np.max(np.abs(raw_window), axis=1)
-            broken_electrode_count = np.sum(max_per_channel > 2000.0)
-            if broken_electrode_count >= 8: continue 
+            broken_counts = np.sum(max_per_channel_all > 2000.0, axis=1)
+            valid_broken_mask = broken_counts < 8
             
-            good_channels_mask = max_per_channel <= 2000.0
-            if np.max(np.abs(raw_window[good_channels_mask])) < 15.0: continue
+            good_channels_mask_all = max_per_channel_all <= 2000.0
+            max_good_only = np.where(good_channels_mask_all, max_per_channel_all, 0.0)
+            window_peaks_all = np.median(max_good_only, axis=1)
+            valid_silence_mask = window_peaks_all >= 5.0
+            
+            survivor_mask = valid_broken_mask & valid_silence_mask
+            survivor_indices = np.where(survivor_mask)[0]
+            print(f"   -> C-Level Sieve dropped {strided_data.shape[0] - len(survivor_indices)} empty/broken frames.")
+            
+            current_batch = []
+            
+            for i in survivor_indices:
+                raw_window = strided_data[i]
+                timestamp_start = i * step_samples / fs
                 
-            q75, q25 = np.percentile(raw_window, [75, 25], axis=1, keepdims=True)
-            iqr = np.maximum(q75 - q25, 10.0)
-            median = np.median(raw_window, axis=1, keepdims=True)
-            normalized_window = (raw_window - median) / iqr
-            normalized_window[~good_channels_mask] = 0.0
-            
-            # --- EARLY FUSION: UPGRADED 4D DYNAMIC MATH ---
-            valid_channels_inf = raw_window[good_channels_mask]
-            if len(valid_channels_inf) > 0:
+                max_per_channel = max_per_channel_all[i]
+                good_channels_mask = good_channels_mask_all[i]
+                
+                valid_channels_inf = raw_window[good_channels_mask]
+                if len(valid_channels_inf) == 0: continue
+                
+                window_median_abs = np.median(np.abs(valid_channels_inf), axis=0) 
+                q75_val = np.percentile(window_median_abs, 75)
+                window_peak = np.max(window_median_abs)
+                
+                if window_peak < (q75_val * 1.2):
+                    continue
+                
+                voltage_envelope = np.mean(abs_strided[i], axis=0)
+                peak_sample_idx = np.argmax(voltage_envelope)
+                true_burst_time = timestamp_start + (peak_sample_idx / fs)
+                    
+                q75, q25 = np.percentile(raw_window, [75, 25], axis=1, keepdims=True)
+                iqr = np.maximum(q75 - q25, 10.0)
+                median = np.median(raw_window, axis=1, keepdims=True)
+                normalized_window = (raw_window - median) / iqr
+                normalized_window[~good_channels_mask] = 0.0
+                
                 burst_peak_to_peak = np.max(np.ptp(valid_channels_inf, axis=1))
-            else:
-                burst_peak_to_peak = 0.0
+                relative_amplitude = burst_peak_to_peak / global_background_baseline
                 
-            relative_amplitude = burst_peak_to_peak / global_background_baseline
-            delta_ratio = calculate_relative_delta(raw_window, fs)
-            spec_entropy = calculate_spectral_entropy(raw_window, fs)
-            scaled_absolute_v = burst_peak_to_peak / 1000.0
-            
-            physics_array = np.array([scaled_absolute_v, relative_amplitude, delta_ratio, spec_entropy], dtype=np.float32)
-            # ---------------------------------------------
-            
-            current_batch.append((raw_window, normalized_window, physics_array, timestamp_start, true_burst_time))
-            if len(current_batch) >= BATCH_SIZE:
+                delta_ratio, spec_entropy = extract_frequency_features(raw_window, fs)
+                
+                peak_val = np.max(voltage_envelope)
+                half_max_indices = np.where(voltage_envelope > (peak_val * 0.5))[0]
+                
+                if len(half_max_indices) > 0:
+                    burst_width_sec = (half_max_indices[-1] - half_max_indices[0]) / fs
+                else:
+                    burst_width_sec = 0.0
+                    
+                derivatives = np.diff(valid_channels_inf, axis=1)
+                sharpness = np.max(np.abs(derivatives)) / (peak_val + 1e-6)
+
+                scaled_absolute_v = burst_peak_to_peak / 1000.0
+                
+                physics_array = np.array([
+                    scaled_absolute_v, 
+                    relative_amplitude, 
+                    delta_ratio, 
+                    spec_entropy, 
+                    burst_width_sec, 
+                    sharpness
+                ], dtype=np.float32)
+                
+                current_batch.append((raw_window, normalized_window, physics_array, timestamp_start, true_burst_time))
+                if len(current_batch) >= BATCH_SIZE:
+                    tensor_queue.put(current_batch)
+                    current_batch = []
+                    
+            if current_batch:
                 tensor_queue.put(current_batch)
-                current_batch = []
                 
-        if current_batch:
-            tensor_queue.put(current_batch)
-            
         tensor_queue.put(None)
         npu_thread.join()
 
-        # --- FIX 4: BIOLOGICALLY-GATED GREEDY NMS ---
         final_candidates = []
         if len(candidates) > 0:
             sorted_cands = sorted(candidates, key=lambda x: x['conf'], reverse=True)
@@ -324,7 +361,6 @@ def analyze_cohort(test_folder_path, confidence_threshold=0.50):
             approved_bursts = []
             print(" -> No bursts detected by AI.")
 
-        # --- PHASE D: CLINICAL DSP MATH ---
         if len(approved_bursts) > 1:
             approved_bursts = sorted(approved_bursts, key=lambda x: x['timestamp_start'])
             stitched_bursts = [approved_bursts[0]]
@@ -350,7 +386,6 @@ def analyze_cohort(test_folder_path, confidence_threshold=0.50):
                 ibi = true_time - last_burst_timestamp
             last_burst_timestamp = true_time
             
-            # Use raw unscaled voltage for the CSV just for graphing purposes
             peak_to_peak_uV = phys_arr[0] * 1000.0 
             
             latent_vectors.append(cand['latent'])
@@ -363,7 +398,9 @@ def analyze_cohort(test_folder_path, confidence_threshold=0.50):
                 "Relative_Amplitude_SNR": phys_arr[1],
                 "Inter_Burst_Interval_s": ibi,
                 "Relative_Delta_Ratio": phys_arr[2],
-                "Spectral_Entropy": phys_arr[3]
+                "Spectral_Entropy": phys_arr[3],
+                "Burst_Width_sec": phys_arr[4],
+                "Sharpness": phys_arr[5]
             })
 
     # ==========================================
@@ -373,42 +410,68 @@ def analyze_cohort(test_folder_path, confidence_threshold=0.50):
         print("\nNot enough approved bursts across cohort to perform t-SNE mapping.")
         return
 
-    print("\nMapping AI Hidden Commonalities (Anchored Early Fusion)...")
+    print("\nMapping AI Hidden Commonalities (Fully Restored Pipeline)...")
     
     latent_matrix = np.array(latent_vectors) 
     df_temp = pd.DataFrame(extracted_data)
-    physical_features = df_temp[['Scaled_Absolute_V', 'Relative_Delta_Ratio', 'Spectral_Entropy']].values
     
-    # --- FIX A: ROBUST PERCENTILE CLIPPING ---
-    # Clips mechanical artifacts so standard deviation isn't blown out
-    p5 = np.percentile(physical_features, 5, axis=0)
-    p95 = np.percentile(physical_features, 95, axis=0)
-    physical_clipped = np.clip(physical_features, p5, p95)
+    physical_features = np.array(df_temp[[
+        'Scaled_Absolute_V', 'Relative_Amplitude_SNR', 'Relative_Delta_Ratio', 
+        'Spectral_Entropy', 'Burst_Width_sec', 'Sharpness'
+    ]], dtype=np.float32)
+    
+    physical_features[:, 0] = np.log10(physical_features[:, 0] + 1e-6)
+    physical_features[:, 1] = np.log10(physical_features[:, 1] + 1e-6)
+    physical_features[:, 2] = np.log10(physical_features[:, 2] + 1e-6)
+    physical_features[:, 4] = np.log10(physical_features[:, 4] + 1e-6)
+    physical_features[:, 5] = np.log10(physical_features[:, 5] + 1e-6)
+    
+    p1 = np.percentile(physical_features, 1, axis=0) 
+    p99_5 = np.percentile(physical_features, 99.5, axis=0)
+    physical_clipped = np.clip(physical_features, p1, p99_5)
     
     phys_mean = physical_clipped.mean(axis=0)
     phys_std = physical_clipped.std(axis=0)
     physical_scaled = (physical_clipped - phys_mean) / (phys_std + 1e-6)
     
-    fused_matrix = np.hstack((latent_matrix, physical_scaled * 5.0))
-    # -----------------------------------------
+    from sklearn.decomposition import PCA
     
-    kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
-    raw_labels = kmeans.fit_predict(fused_matrix)
+    n_latent_comps = min(6, len(latent_matrix) - 1)
+    pca_latent = PCA(n_components=n_latent_comps, random_state=42)
+    latent_compressed = pca_latent.fit_transform(latent_matrix)
+    
+    # AI Latents successfully fused back with physics
+    fused_balanced = np.hstack((latent_compressed, physical_scaled * 1.5))
+    
+    # Anchor via Relative SNR to ignore skull thickness
+    snr_idx = n_latent_comps + 1
+    sorted_by_snr = np.argsort(fused_balanced[:, snr_idx])
+    
+    idx_5th = max(5, int(len(sorted_by_snr) * 0.05))
+    idx_50th = int(len(sorted_by_snr) * 0.50)
+    idx_95th = min(len(sorted_by_snr) - 5, int(len(sorted_by_snr) * 0.95))
+    
+    seed_classic = fused_balanced[sorted_by_snr[idx_95th - 5 : idx_95th + 5]].mean(axis=0)
+    seed_burnout = fused_balanced[sorted_by_snr[idx_5th - 5 : idx_5th + 5]].mean(axis=0)
+    seed_transitional = fused_balanced[sorted_by_snr[idx_50th - 5 : idx_50th + 5]].mean(axis=0)
+    
+    initial_means = np.array([seed_classic, seed_transitional, seed_burnout])
+    
+    gmm = GaussianMixture(n_components=3, covariance_type='full', means_init=initial_means, random_state=42, n_init=1)
+    raw_labels = gmm.fit_predict(fused_balanced)
     df_temp['Raw_Cluster'] = raw_labels
     
-    # Identify the Ordinal Severity (0 = Highest Volts/Stage 1, 2 = Lowest Volts/Stage 3)
-    cluster_severity = df_temp.groupby('Raw_Cluster')['Scaled_Absolute_V'].median().sort_values(ascending=False)
+    cluster_severity = df_temp.groupby('Raw_Cluster')['Relative_Amplitude_SNR'].median().sort_values(ascending=False)
     rank_mapping = {cluster_severity.index[0]: 0, cluster_severity.index[1]: 1, cluster_severity.index[2]: 2}
     df_temp['Ordinal_Rank'] = df_temp['Raw_Cluster'].map(rank_mapping)
-    
-    # --- FIX B: HIDDEN MARKOV MODEL (HMM) TEMPORAL SMOOTHING ---
+
+    # -> HMM RESTORED: To prevent blinks from creating "false stage" events mid-recording
     try:
         from hmmlearn import hmm
         print("Applying Hidden Markov Model (HMM) to enforce clinical continuity...")
         
-        # Define strict biological rules: Mostly stays the same, slight chance to progress, rarely reverses.
         hmm_model = hmm.CategoricalHMM(n_components=3, init_params="")
-        hmm_model.startprob_ = np.array([0.6, 0.3, 0.1]) 
+        hmm_model.startprob_ = np.array([0.33, 0.33, 0.34]) 
         hmm_model.transmat_ = np.array([
             [0.95, 0.05, 0.00], 
             [0.02, 0.93, 0.05], 
@@ -417,10 +480,9 @@ def analyze_cohort(test_folder_path, confidence_threshold=0.50):
         hmm_model.emissionprob_ = np.array([
             [0.85, 0.15, 0.00], 
             [0.10, 0.80, 0.10], 
-            [0.00, 0.15, 0.85]  
+            [0.00, 0.05, 0.95]  
         ])
         
-        # Apply smoothing chronologically for each patient's individual timeline
         for pid in df_temp['Patient_ID'].unique():
             patient_mask = df_temp['Patient_ID'] == pid
             seq = df_temp.loc[patient_mask, 'Ordinal_Rank'].values.reshape(-1, 1)
@@ -429,20 +491,19 @@ def analyze_cohort(test_folder_path, confidence_threshold=0.50):
                 df_temp.loc[patient_mask, 'Ordinal_Rank'] = smoothed_seq
                 
     except ImportError:
-        print("\n[WARNING] 'hmmlearn' not installed. Skipping HMM smoothing. (Run: pip install hmmlearn)")
+        print("\n[WARNING] 'hmmlearn' not installed.")
     except Exception as e:
-        print(f"\n[WARNING] HMM Smoothing failed: {e}. Falling back to AI raw clusters.")
-    # ----------------------------------------------------------
+        print(f"\n[WARNING] HMM Smoothing failed: {e}.")
 
-    # Map the smoothed ranks to strings
     final_mapping_dict = {0: "Stage 1 (Classic)", 1: "Stage 2 (Transitional)", 2: "Stage 3 (Burnout)"}
     cluster_labels = df_temp['Ordinal_Rank'].map(final_mapping_dict).tolist()
     
-    perplexity_val = min(30, len(fused_matrix) - 1)
-    tsne = TSNE(n_components=2, perplexity=perplexity_val, random_state=42)
-    latent_2d = tsne.fit_transform(fused_matrix) 
+    perplexity_val = min(50, max(5, len(fused_balanced) // 3))
+    print(f"Running stabilized t-SNE (Perplexity: {perplexity_val})...")
+    
+    tsne = TSNE(n_components=2, perplexity=perplexity_val, init='pca', learning_rate='auto', random_state=42)
+    latent_2d = tsne.fit_transform(fused_balanced) 
 
-    # Re-pack the smoothed data into the list to ensure the CSV and plotting are aligned perfectly
     for i, row in enumerate(extracted_data):
         row["Latent_X"] = latent_2d[i, 0]
         row["Latent_Y"] = latent_2d[i, 1]
@@ -450,7 +511,6 @@ def analyze_cohort(test_folder_path, confidence_threshold=0.50):
 
     df = pd.DataFrame(extracted_data)
 
-    # --- FIX 6: CLINICAL IBI UPGRADES (SMOOTHING & PERIODICITY) ---
     if len(df) > 5:
         df = df.sort_values(by=['Patient_ID', 'Timestamp_s']).reset_index(drop=True)
         df['Rolling_Median_IBI_s'] = df.groupby('Patient_ID')['Inter_Burst_Interval_s'].transform(
@@ -464,9 +524,6 @@ def analyze_cohort(test_folder_path, confidence_threshold=0.50):
     df.to_csv("sspe_cohort_analysis.csv", index=False)
     print("\nExtraction Complete! Deep cohort data saved to 'sspe_cohort_analysis.csv'")
 
-# ==========================================
-# FINAL EXECUTION BLOCK (DIAGNOSTIC MODE)
-# ==========================================
 if __name__ == "__main__":
     print("\n[SYSTEM] Main execution block triggered successfully!")
     

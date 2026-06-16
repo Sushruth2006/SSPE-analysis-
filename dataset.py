@@ -12,8 +12,6 @@ class RadermeckerDataset(Dataset):
         self.data = []
         self.labels = []
         self.patient_labels = []
-        
-        # --- NEW: Store the global baseline for each window ---
         self.baselines = []
         
         mne.set_log_level('WARNING')
@@ -74,11 +72,9 @@ class RadermeckerDataset(Dataset):
             raw.filter(l_freq=0.5, h_freq=30.0) 
             if raw.info['sfreq'] != target_fs: raw.resample(sfreq=target_fs)
             
-            # --- NEW: PRE-CALCULATE HARDWARE BASELINE ---
-            # Calculate the 25th percentile of the full recording to get the absolute resting voltage
+            # Pre-calculate hardware baseline in MICROVOLTS
             raw_data_uV = raw.get_data() * 1e6
             patient_baseline = np.maximum(np.percentile(np.abs(raw_data_uV), 25), 1.0)
-            # --------------------------------------------
                 
             try:
                 events, actually_found_events = mne.events_from_annotations(raw, event_id=event_dict)
@@ -90,7 +86,6 @@ class RadermeckerDataset(Dataset):
                 self.labels.append(epochs.events[:, -1]) 
                 self.patient_labels.append(np.full(len(epochs.events[:, -1]), p_id))
                 
-                # Attach the patient's global baseline to every single window we just extracted
                 self.baselines.extend([patient_baseline] * len(extracted_epochs))
                 
             except ValueError as e:
@@ -111,52 +106,75 @@ class RadermeckerDataset(Dataset):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        raw_x = self.data[idx] * 1e6 
+        # -> DSP FIX: Keep the raw data in Volts for frequency math to prevent V^2 explosion
+        raw_x_volts = self.data[idx] 
+        
+        # Convert to microvolts ONLY for amplitude calculations and neural network input
+        raw_x = raw_x_volts * 1e6 
         fs = 256
         
-        # Move channel masking UP so we can use it for physics math
         max_per_channel = np.max(np.abs(raw_x), axis=1)
         good_channels_mask = max_per_channel <= 2000.0
 
         # ==========================================
         # EARLY FUSION: ON-THE-FLY PHYSICS MATH
         # ==========================================
-        # 1. Global Peak-to-Peak (Check the whole skull, not just Cz)
         valid_channels = raw_x[good_channels_mask]
         if len(valid_channels) > 0:
             burst_peak_to_peak = np.max(np.ptp(valid_channels, axis=1))
         else:
             burst_peak_to_peak = 0.0
             
-        # 2. Hardware-Agnostic Severity (SNR)
         relative_amplitude = burst_peak_to_peak / self.baselines[idx]
         
-        # 3. Slow-Wave Ratio (Delta/Alpha) - Still using Cz (idx 9) for frequency baseline
-        freqs, psd = welch(raw_x[9], fs=fs, nperseg=fs)
+        # -> DSP FIX: Run Welch PSD on the UNSCALED VOLTS
+        freqs, psd = welch(raw_x_volts[9], fs=fs, nperseg=fs)
         delta_mask = (freqs >= 1.0) & (freqs <= 4.0)
         alpha_mask = (freqs >= 8.0) & (freqs <= 12.0)
+        
         delta_power = np.trapezoid(psd[delta_mask], freqs[delta_mask])
         alpha_power = np.trapezoid(psd[alpha_mask], freqs[alpha_mask])
-        delta_ratio = delta_power / (alpha_power + 1e-6)
+        delta_ratio = delta_power / (alpha_power + 1e-12) # Use 1e-12 for Volts!
         
-        # 4. Electrical Chaos (Spectral Entropy)
-        psd_norm = psd / np.sum(psd)
+        psd_norm = psd / (np.sum(psd) + 1e-12)
         spec_entropy = entropy(psd_norm)
         
-        # -> NEW FIX: Scale the absolute voltage so it doesn't crash the neural network gradients
+        # -> MORPHOLOGY UPGRADES (Match compneuro.py exactly)
+        voltage_envelope = np.mean(np.abs(raw_x), axis=0)
+        peak_val = np.max(voltage_envelope)
+        half_max_indices = np.where(voltage_envelope > (peak_val * 0.5))[0]
+        
+        if len(half_max_indices) > 0:
+            burst_width_sec = (half_max_indices[-1] - half_max_indices[0]) / fs
+        else:
+            burst_width_sec = 0.0
+            
+        if len(valid_channels) > 0:
+            derivatives = np.diff(valid_channels, axis=1)
+            sharpness = np.max(np.abs(derivatives)) / (peak_val + 1e-6)
+        else:
+            sharpness = 0.0
+
         scaled_absolute_v = burst_peak_to_peak / 1000.0 
         
-        # -> CRITICAL FIX: Ensure this array contains exactly 4 variables!
-        physics_array = np.array([scaled_absolute_v, relative_amplitude, delta_ratio, spec_entropy], dtype=np.float32)
+        # -> THE ALIGNMENT FIX: Output all 6 physical features to train the FiLM layer
+        physics_array = np.array([
+            scaled_absolute_v, 
+            relative_amplitude, 
+            delta_ratio, 
+            spec_entropy,
+            burst_width_sec,
+            sharpness
+        ], dtype=np.float32)
         
         # ==========================================
         # SHAPE NORMALIZATION & DROPOUT
         # ==========================================
         q75, q25 = np.percentile(raw_x, [75, 25], axis=1, keepdims=True)
-        iqr = q75 - q25
+        iqr = np.maximum(q75 - q25, 10.0) # Ensure no divide by zero on flatlines
         median = np.median(raw_x, axis=1, keepdims=True)
         
-        normalized_x = (raw_x - median) / (iqr + 1e-6)
+        normalized_x = (raw_x - median) / iqr
         normalized_x[~good_channels_mask] = 0.0
         
         if np.random.rand() < 0.5:
@@ -172,5 +190,4 @@ class RadermeckerDataset(Dataset):
         y_clinical = torch.tensor(self.labels[idx], dtype=torch.long)
         y_patient = torch.tensor(self.patient_labels[idx], dtype=torch.long)
         
-        # Now yielding 4 items to match the new train_loader unpacking
         return x, physics_tensor, y_clinical, y_patient

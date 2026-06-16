@@ -9,10 +9,11 @@ env/
 venv/
 ENV/
 
-# Data
-data/train/*
-data/test/*
-!data/README.md
+# Jupyter Notebook Checkpoints (Recommended addition)
+.ipynb_checkpoints/
+
+# Data Folders (Root level)
+data/
 
 # Models/Weights
 *.pth
@@ -22,3 +23,7 @@ data/test/*
 .DS_Store
 .vscode/
 .idea/
+
+# Generated output files
+*.csv
+*.html
